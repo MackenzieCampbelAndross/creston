@@ -1,0 +1,38 @@
+[project]
+name = "creston"
+version = "0.1.0"
+description = "Convert 2D architectural floor plans into 3D house models"
+requires-python = ">=3.11"
+dependencies = [
+    "opencv-python>=4.9",
+    "numpy>=1.26",
+    "pillow>=10.0",
+    "pdf2image>=1.17",
+    "pytesseract>=0.3.10",
+    "trimesh>=4.0",
+]
+
+[project.optional-dependencies]
+# Segmentation training/inference. Kept separate so geometry work does not
+# pull down a multi-gigabyte torch install.
+ml = [
+    "torch>=2.2",
+    "segmentation-models-pytorch>=0.3",
+]
+dev = ["pytest>=8.0"]
+# The Blender path in blender_render.py, driven headlessly through bpy.
+# This one pulls 659 MB, which is why it stays its own extra rather than
+# living in the base install -- most machines running the pipeline will
+# never need it.
+render = ["bpy>=5.2,<6"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["creston*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

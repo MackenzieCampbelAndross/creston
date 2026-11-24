@@ -1,0 +1,996 @@
+"""Turn a segmentation mask into measurable geometry.
+
+Walls are recovered by orientation rather than by contour. Walls in a floor
+plan meet at corners, so the wall class forms one connected region per
+enclosure -- tracing its contour yields the outline of the whole building,
+not individual walls. Opening the mask with a long horizontal kernel keeps
+only pixels belonging to a horizontal run, and likewise for vertical, which
+separates a closed loop into its constituent segments. Architectural walls
+are overwhelmingly axis-aligned, so the two passes cover them; the small
+overlap where segments meet at corners is harmless once extruded.
+
+Rooms are contours, simplified so a rectangle comes back as four corners
+rather than a few hundred boundary pixels.
+"""
+
+import logging
+
+import cv2
+import numpy as np
+
+from creston.classes import (
+    CLASS_NAMES,
+    DOOR,
+    ROOM,
+    ROOM_CLASSES,
+    WALL,
+    WINDOW,
+)
+from creston.geometry_types import MIN_POLYGON_VERTICES, Opening, Room, Wall
+
+logger = logging.getLogger(__name__)
+
+# --- how big things are, relative to the drawing itself ----------------------
+#
+# These were absolute pixel counts, measured on drawings around 28-30 pixels
+# per foot. That is a resolution, not a property of any building, and it made
+# the pipeline quietly dependent on one: the same CubiCasa plan reconstructed
+# with 15 walls at half size and 40 at double, and its inferred scale went
+# from 8% out to 48% out. A plan is the same building whatever size it is
+# rendered at, and it now reconstructs that way.
+#
+# Everything is a multiple of the drawing's own wall thickness -- the one
+# length a floor plan always contains, is drawn to scale, and can be
+# measured from before anything else is known. A doorway is about three and
+# a half wall thicknesses wide whatever the drawing's resolution.
+#
+# The ratios are the old constants divided by the gauge they were measured
+# at, so behaviour at that resolution is unchanged.
+REFERENCE_GAUGE = 24.0
+
+# Shortest run that counts as a wall rather than speckle. This one also
+# sizes the morphological kernel that separates horizontal runs from
+# vertical ones, so it cannot simply shrink with the drawing: below about
+# a dozen pixels the opening stops decomposing a corner at all and a
+# four-sided room comes back as one ring-shaped "wall". The floor is what
+# that stage needs to work; the ratio is what carries it up to larger
+# sheets, which is the direction that was actually broken.
+MIN_WALL_LENGTH_RATIO = 0.5
+MIN_WALL_LENGTH_FLOOR = 12
+# How much longer than a wall is thick the severing kernel must be. Above
+# one it erases the perpendicular walls; comfortably above it also survives
+# the gauge reading a little high at junctions, which it does.
+SEVER_RATIO = 2.0
+# Smallest region that counts as a room, as a multiple of the gauge squared.
+MIN_ROOM_AREA_RATIO = 100 / REFERENCE_GAUGE**2
+# Contour simplification, in allowed deviation.
+#
+# Deliberately not a fraction of perimeter. A relative tolerance scales with
+# the outline's size, so the building footprint -- by far the longest
+# contour -- gets the coarsest treatment exactly where precision matters
+# most: at 2% of perimeter it cut diagonal shortcuts across whole corners,
+# turning a rectilinear building into a jagged wedge. Against the wall
+# thickness it stays fixed relative to the building's own detail.
+SIMPLIFY_RATIO = 4.0 / REFERENCE_GAUGE
+# Smallest door or window blob worth trusting.
+MIN_OPENING_AREA_RATIO = 40 / REFERENCE_GAUGE**2
+# An opening further than this from any wall is dropped rather than bound to
+# a distant one -- a misplaced opening cuts a hole through solid geometry.
+MAX_OPENING_DISTANCE_RATIO = 40.0 / REFERENCE_GAUGE
+# Footprint cleanup: bridge doorways, then erase spurs narrower than this.
+CLOSE_SPAN_RATIO = 9 / REFERENCE_GAUGE
+OPEN_SPAN_RATIO = 25 / REFERENCE_GAUGE
+# Collinear runs closer than this along their line are one wall. Sized to
+# span a doorway, which is what usually splits a wall in two.
+MERGE_GAP_RATIO = 90.0 / REFERENCE_GAUGE
+# Runs whose shared coordinate differs by less than this are on one line.
+MERGE_OFFSET_RATIO = 12.0 / REFERENCE_GAUGE
+
+# The values at the reference gauge, for callers that have no mask to
+# measure and for the tests that pinned the old behaviour.
+MIN_WALL_LENGTH = int(MIN_WALL_LENGTH_RATIO * REFERENCE_GAUGE)
+MIN_ROOM_AREA = int(MIN_ROOM_AREA_RATIO * REFERENCE_GAUGE**2)
+SIMPLIFY_PIXELS = SIMPLIFY_RATIO * REFERENCE_GAUGE
+MIN_OPENING_AREA = int(MIN_OPENING_AREA_RATIO * REFERENCE_GAUGE**2)
+MAX_OPENING_DISTANCE = MAX_OPENING_DISTANCE_RATIO * REFERENCE_GAUGE
+CLOSE_SPAN = int(CLOSE_SPAN_RATIO * REFERENCE_GAUGE)
+OPEN_SPAN = int(OPEN_SPAN_RATIO * REFERENCE_GAUGE)
+MERGE_GAP = MERGE_GAP_RATIO * REFERENCE_GAUGE
+MERGE_OFFSET = MERGE_OFFSET_RATIO * REFERENCE_GAUGE
+
+# Closing the building envelope. These are in feet rather than pixels
+# because this stage runs after calibration and knows the scale, which is
+# the better reference wherever it is available -- a doorway is 2'6" on
+# every drawing ever made.
+ENVELOPE_SAMPLE_FT = 1.0
+ENVELOPE_NEAR_FT = 2.0
+ENVELOPE_PROBE_FT = 2.5
+# Shorter gaps than this are doorways and reveals, not missing wall.
+ENVELOPE_MIN_GAP_FT = 3.0
+ENVELOPE_WALL_FT = 0.75
+
+# A drawing whose walls measure outside this range of the reference is
+# treated as unmeasurable and given the reference gauge instead. Both ends
+# are far outside anything a real plan produces; the guard is against a
+# mask so poor that the measurement means nothing.
+GAUGE_LIMITS = (4.0, 240.0)
+
+
+# Below this many walls the median is not worth trusting, so nothing is
+# thrown away. A handful of runs on a sparse drawing could easily be
+# mostly hatching, and taking their median would then discard the walls
+# and keep the hatching.
+MIN_WALLS_TO_JUDGE = 6
+
+# The most of a drawing this may remove. Beyond it the reference was
+# measuring the wrong thing, and the drawing is better served by its
+# original runs than by a fraction of them. Set tight: on a plan where
+# short noise fragments outnumbered the walls, allowing half to go took
+# the real walls with them and left a median wall thickness of two
+# pixels, which put the building at a thirtieth of its size.
+MAX_DROPPED_FRACTION = 0.15
+
+
+# A wall is longer than it is thick. Anything squarer than this is a blob
+# -- a hatched panel, a stair core, the whole building caught by one
+# orientation pass -- and however much of the drawing it covers it says
+# nothing about how thick a wall is.
+MIN_WALL_ASPECT = 1.5
+
+
+def _typical_thickness(walls: list[Wall]) -> float:
+    """The drawing's own wall thickness.
+
+    Two things have to be kept out and they pull in opposite directions.
+
+    Short specks of noise outnumber real walls on a poor mask, so a plain
+    median reports a thickness below any real one. Weighting by length
+    fixes that -- it says what most of the *drawn wall* measures rather
+    than what most of the *runs* measure.
+
+    But weighting by length alone hands the answer to a single enormous
+    blob, which is long as well as thick: on one CubiCasa plan the whole
+    building was caught as one run and reported a wall thickness of 2048
+    pixels. So blobs are excluded first, on the one thing that separates a
+    wall from a panel -- a wall is much longer than it is thick.
+    """
+    slender = [
+        wall
+        for wall in walls
+        if wall.thickness > 0 and wall.length() >= wall.thickness * MIN_WALL_ASPECT
+    ]
+    # If nothing is slender the drawing is all blobs, and its own runs are
+    # a better answer than none.
+    ordered = sorted(slender or walls, key=lambda wall: wall.thickness)
+
+    lengths = np.array([max(wall.length(), 1.0) for wall in ordered])
+    running = np.cumsum(lengths)
+    middle = int(np.searchsorted(running, running[-1] / 2.0))
+    return float(ordered[min(middle, len(ordered) - 1)].thickness)
+
+
+# Least wall a drawing must carry before its gauge is worth measuring, as
+# a share of the page. Below it the mask is mostly background and the
+# measurement says more about noise than about the building.
+MIN_WALL_SHARE = 0.002
+
+
+def wall_gauge(mask: np.ndarray, wall_class: int = WALL) -> float:
+    """The drawing's own wall thickness in pixels.
+
+    The one length a floor plan always contains, always draws to scale, and
+    can be measured before anything else is known -- there is no room list
+    yet, no calibration, and nothing saying what the sheet's resolution
+    means. Every other size in this module is expressed against it, so the
+    same building reconstructs the same way whatever size it is rendered
+    at.
+
+    Measured from the distance transform rather than from wall runs.
+    Distance-to-background across a wall of thickness ``t`` is spread
+    evenly over ``0`` to ``t/2``, so the median sits at ``t/4``. It is the
+    right tool because it asks every wall pixel the same local question and
+    weights nothing by length or area, which is what defeated the earlier
+    attempts: measuring runs, a drawing with more specks than walls
+    reported a thickness below any real one, and weighting those runs by
+    length instead handed the answer to whichever blob was biggest -- one
+    plan came back with a 2048 pixel wall.
+
+    Falls back to the reference gauge where the mask holds too little wall
+    to measure, or the answer is outside anything a real drawing produces.
+    A wrong gauge is worse than the reference: it rescales every threshold
+    at once.
+    """
+    binary = (mask == wall_class).astype(np.uint8)
+    if binary.mean() < MIN_WALL_SHARE:
+        logger.info("too little wall to measure a gauge; using the reference")
+        return REFERENCE_GAUGE
+
+    distances = cv2.distanceTransform(binary, cv2.DIST_L2, 5)[binary > 0]
+    gauge = 4.0 * float(np.median(distances))
+
+    low, high = GAUGE_LIMITS
+    if not low <= gauge <= high:
+        logger.info("wall gauge %.1f px is implausible; using the reference", gauge)
+        return REFERENCE_GAUGE
+
+    logger.info("wall gauge %.1f px (reference %.0f)", gauge, REFERENCE_GAUGE)
+    return gauge
+
+
+def _segments_along(
+    binary: np.ndarray,
+    horizontal: bool,
+    min_length: int,
+    sever: int | None = None,
+) -> list[Wall]:
+    """Extract wall segments running in one direction.
+
+    The opening has one job: erase the walls running the other way, so what
+    is left can be split into separate runs. For that its kernel has to be
+    longer than those walls are thick -- a horizontal kernel shorter than a
+    vertical wall's width slides along inside it and keeps it.
+
+    That is what ``sever`` sets, and it is separate from ``min_length``.
+    They were the same value, and at a wall thickness of 24 pixels against
+    a kernel of 12 nothing was severed at all: the perimeter came back as
+    one connected ring, reported as a single "wall" a thousand pixels
+    thick. Sized off the drawing's gauge, the same plan decomposes into the
+    walls it is drawn with.
+    """
+    sever = max(int(sever or min_length), 3)
+    kernel_shape = (sever, 1) if horizontal else (1, sever)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_shape)
+    runs = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+    count, labels = cv2.connectedComponents(runs)
+
+    walls: list[Wall] = []
+    for label in range(1, count):
+        ys, xs = np.where(labels == label)
+        if len(xs) == 0:
+            continue
+
+        if horizontal:
+            length = xs.max() - xs.min() + 1
+            thickness = ys.max() - ys.min() + 1
+            centre = (ys.min() + ys.max()) / 2.0
+            start = (float(xs.min()), centre)
+            end = (float(xs.max()), centre)
+        else:
+            length = ys.max() - ys.min() + 1
+            thickness = xs.max() - xs.min() + 1
+            centre = (xs.min() + xs.max()) / 2.0
+            start = (centre, float(ys.min()))
+            end = (centre, float(ys.max()))
+
+        if length < min_length:
+            continue
+
+        walls.append(Wall(start=start, end=end, thickness=float(thickness)))
+
+    return walls
+
+
+def _merge_collinear(walls: list[Wall], gap: float, offset: float) -> list[Wall]:
+    """Join wall segments lying on the same line into single runs.
+
+    Segmentation breaks one continuous wall into several runs wherever a
+    doorway, a dimension leader or a patch of noise interrupts it. Extruded
+    separately those become abutting boxes with a visible seam at every
+    joint, and openings measured along a stub sit at the wrong distance.
+    """
+    merged: list[Wall] = []
+
+    for horizontal in (True, False):
+        axis, along = (1, 0) if horizontal else (0, 1)
+
+        candidates = [
+            wall
+            for wall in walls
+            if (abs(wall.end[1] - wall.start[1]) < abs(wall.end[0] - wall.start[0]))
+            == horizontal
+        ]
+
+        # Group by the shared coordinate, so only walls on one line combine.
+        #
+        # Grouped by how far apart they actually are rather than by rounding
+        # each into a fixed bucket. Bucketing made the answer depend on
+        # where the building happened to sit on the page: two runs six
+        # pixels apart merged at one position and not at another, purely
+        # because they straddled a boundary. A wall meeting a thicker wall
+        # always offsets by half their difference, so this is the ordinary
+        # case rather than an edge one.
+        lanes: list[list[Wall]] = []
+        for wall in sorted(candidates, key=lambda w: w.start[axis]):
+            if lanes and wall.start[axis] - lanes[-1][-1].start[axis] <= offset:
+                lanes[-1].append(wall)
+            else:
+                lanes.append([wall])
+
+        for lane in lanes:
+            lane.sort(key=lambda w: min(w.start[along], w.end[along]))
+
+            current = lane[0]
+            for wall in lane[1:]:
+                current_end = max(current.start[along], current.end[along])
+                next_start = min(wall.start[along], wall.end[along])
+
+                if next_start - current_end <= gap:
+                    next_end = max(wall.start[along], wall.end[along])
+                    far = max(current_end, next_end)
+                    near = min(current.start[along], current.end[along])
+                    shared = (current.start[axis] + wall.start[axis]) / 2
+
+                    start = (near, shared) if horizontal else (shared, near)
+                    end = (far, shared) if horizontal else (shared, far)
+                    current = Wall(
+                        start=start,
+                        end=end,
+                        thickness=max(current.thickness, wall.thickness),
+                    )
+                else:
+                    merged.append(current)
+                    current = wall
+            merged.append(current)
+
+    return merged
+
+
+# How many times the drawing's own median wall thickness a run may measure
+# before it is not a wall at all. Deliberately relative rather than a
+# figure in feet: wall extraction runs before the scale is known, and the
+# thicknesses on the drawing are the only reference available at that
+# point. It also means the rule needs no adjusting between a plan drawn at
+# 1:50 and one at 1:200.
+#
+# Real walls span a narrow range -- a 4 inch partition to an 18 inch
+# external wall, occasionally a 2 foot column -- so four times the median
+# clears every wall a building actually has. What it catches is boundary
+# hatching, dimension bands and title-block rules, which the segmenter
+# reports as enormously thick walls: on the reference sheet the median run
+# is 10 inches and the fattest is nearly ten feet.
+# How much thicker than the drawing's other walls a run may be before it is
+# not a wall at all. A drawing's walls are near enough all one thickness, so
+# a run several times the rest is something else wearing a wall's clothes:
+# a title-block rule, a hatched section, a dimension band, or two walls the
+# orientation pass has fused across a room.
+#
+# Swept over 30 plans against the annotations. It is the single biggest
+# lever on how much invented wall gets built:
+#
+#     max thickness   coverage   agreement
+#           4.0         99.0%       88.4%
+#           2.8         98.7%       91.2%
+#         * 2.5         97.4%       93.0%
+#           2.2         96.9%       92.3%
+#           2.0         97.4%       92.1%
+#
+# 2.4 to 2.6 all give 93.0%, so this sits in the middle of a plateau rather
+# than on a peak. It trades 1.6 points of coverage for 4.6 of agreement,
+# and the wall and opening counts do not move -- what it removes is a
+# handful of grossly over-thick runs per plan, not real wall.
+MAX_THICKNESS_RATIO = 2.5
+
+def _drop_impossibly_thick(walls: list[Wall]) -> list[Wall]:
+    """Remove runs far thicker than the drawing's own walls.
+
+    A ten foot thick wall is not a wall. Left in, it becomes a solid slab
+    across the plan -- and worse, it drags the wall-thickness scale
+    estimate with it, so the whole building comes out the wrong size.
+    """
+    if len(walls) < MIN_WALLS_TO_JUDGE:
+        return walls
+
+    limit = _typical_thickness(walls) * MAX_THICKNESS_RATIO
+    kept = [wall for wall in walls if wall.thickness <= limit]
+
+    dropped = len(walls) - len(kept)
+    if not dropped:
+        return walls
+    if dropped > len(walls) * MAX_DROPPED_FRACTION:
+        logger.info(
+            "not dropping %d of %d run(s): too many to be hatching", dropped, len(walls)
+        )
+        return walls
+
+    logger.info("dropped %d run(s) thicker than %.0f px; not walls", dropped, limit)
+    return kept
+
+
+def _clamp_to_the_drawing(walls: list[Wall], gauge: float) -> list[Wall]:
+    """Cut back runs far thicker than the drawing's own wall.
+
+    ``_drop_impossibly_thick`` judges each run against the median of the
+    *built* walls, so a plan carrying several over-thick runs raises its own
+    ceiling and keeps them. The gauge is measured from the mask instead, and
+    does not move.
+
+    They are cut back rather than dropped because they are usually a real
+    wall read too fat -- a stair core, a hatched panel, two parallel walls
+    caught as one run -- so the line is right and only the thickness is
+    wrong. Dropping them outright was measured on the 60 held-out plans and
+    costs far too much: plans below 70% wall coverage go from 2 to 9.
+
+    Measured, clamping against dropping against leaving them (60 plans):
+    median agreement 94.6% either way, mean 91.2% to 91.8%, and end to end
+    41 of 60 plans right on every check to 42, with wall failures 8 to 7.
+    """
+    limit = gauge * MAX_THICKNESS_RATIO
+    for wall in walls:
+        if wall.thickness > limit:
+            wall.thickness = float(limit)
+    return walls
+
+
+def extract_walls(
+    mask: np.ndarray,
+    wall_class: int = WALL,
+    min_wall_length: int | None = None,
+    merge: bool = True,
+    gauge: float | None = None,
+) -> list[Wall]:
+    """Recover wall segments from a class mask, in the mask's pixel coordinates.
+
+    Walls come out exactly axis-aligned: each run's endpoints are placed on
+    its bounding box centreline, so segmentation noise along an edge cannot
+    tilt the result. The cost is that a genuinely diagonal wall is not
+    recovered at all -- the orientation filters erase it -- which is
+    acceptable for the rectilinear plans this targets.
+
+    Doors and windows are read as wall here. An opening is drawn in the wall
+    it interrupts, and a model trained on solid window labels paints it over
+    that wall: read as a gap, the wall came apart at every window, and over
+    60 held-out plans 222 of 477 windows were left with no wall near enough
+    to be built into. The openings are cut back out of the wall when the
+    model is extruded.
+    """
+    if not (mask == wall_class).any():
+        return []
+    binary = np.isin(mask, (wall_class, DOOR, WINDOW)).astype(np.uint8)
+
+    gauge = wall_gauge(mask, wall_class) if gauge is None else gauge
+    if min_wall_length is None:
+        min_wall_length = max(
+            int(MIN_WALL_LENGTH_RATIO * gauge), MIN_WALL_LENGTH_FLOOR
+        )
+
+    sever = int(SEVER_RATIO * gauge)
+    walls = _segments_along(
+        binary, horizontal=True, min_length=min_wall_length, sever=sever
+    )
+    walls += _segments_along(
+        binary, horizontal=False, min_length=min_wall_length, sever=sever
+    )
+
+    # A wall is longer than it is thick. Each orientation pass sees the
+    # other's walls end-on -- a band 40 across and 3 deep is reported by
+    # the vertical pass as a wall 40 thick and 3 long -- and those stubs
+    # are the same run counted twice, at right angles.
+    walls = [
+        wall
+        for wall in walls
+        if wall.thickness <= 0 or wall.length() >= wall.thickness * MIN_WALL_ASPECT
+    ] or walls
+    walls = _drop_impossibly_thick(walls)
+    walls = _clamp_to_the_drawing(walls, gauge)
+
+    if merge and walls:
+        before = len(walls)
+        walls = _merge_collinear(
+            walls,
+            gap=MERGE_GAP_RATIO * gauge,
+            offset=MERGE_OFFSET_RATIO * gauge,
+        )
+        logger.info("merged %d wall run(s) into %d", before, len(walls))
+    else:
+        logger.info("extracted %d wall segment(s)", len(walls))
+
+    return walls
+
+
+def _project_onto_wall(point: tuple[float, float], wall: Wall) -> tuple[float, float]:
+    """Distance along the wall to the point's projection, and distance from it."""
+    start = np.array(wall.start)
+    direction = np.array(wall.end) - start
+    length = float(np.linalg.norm(direction))
+    if length == 0:
+        return 0.0, float(np.linalg.norm(np.array(point) - start))
+
+    unit = direction / length
+    offset = np.array(point) - start
+    along = float(np.clip(np.dot(offset, unit), 0.0, length))
+    perpendicular = float(np.linalg.norm(offset - along * unit))
+    return along, perpendicular
+
+
+def extract_openings(
+    mask: np.ndarray,
+    walls: list[Wall],
+    min_area: int | None = None,
+    max_distance: float | None = None,
+    gauge: float | None = None,
+) -> list[Opening]:
+    """Find doors and windows and bind each to the wall it interrupts.
+
+    An opening is only meaningful relative to its wall, so a component that
+    sits too far from any wall is discarded rather than attached to a distant
+    one -- a misplaced opening cuts a hole through solid geometry.
+
+    Sizes come from the drawing's own wall thickness, so a plan rendered
+    at twice the resolution is read the same way rather than losing every
+    opening to a threshold set for a smaller sheet.
+    """
+    if not walls:
+        return []
+
+    gauge = wall_gauge(mask) if gauge is None else gauge
+    if min_area is None:
+        min_area = max(int(MIN_OPENING_AREA_RATIO * gauge**2), 4)
+    if max_distance is None:
+        max_distance = MAX_OPENING_DISTANCE_RATIO * gauge
+
+    openings: list[Opening] = []
+
+    for class_index, opening_type in ((DOOR, "door"), (WINDOW, "window")):
+        binary = (mask == class_index).astype(np.uint8)
+        if not binary.any():
+            continue
+
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
+        for index in range(1, count):
+            if stats[index, cv2.CC_STAT_AREA] < min_area:
+                continue
+
+            centre = (float(centroids[index][0]), float(centroids[index][1]))
+            projections = [
+                (*_project_onto_wall(centre, wall), wall_id)
+                for wall_id, wall in enumerate(walls)
+            ]
+            along, distance, wall_id = min(projections, key=lambda item: item[1])
+
+            if distance > max_distance:
+                logger.debug("dropping %s %.0fpx from any wall", opening_type, distance)
+                continue
+
+            # Width along the wall, from the component's larger extent -- an
+            # opening is drawn as a strip across the wall's thickness.
+            width = float(
+                max(stats[index, cv2.CC_STAT_WIDTH], stats[index, cv2.CC_STAT_HEIGHT])
+            )
+            openings.append(
+                Opening(wall_id=wall_id, position=along, width=width, type=opening_type)
+            )
+
+    logger.info(
+        "extracted %d opening(s): %d door(s), %d window(s)",
+        len(openings),
+        sum(1 for o in openings if o.type == "door"),
+        sum(1 for o in openings if o.type == "window"),
+    )
+    return openings
+
+
+def close_envelope(
+    mask: np.ndarray,
+    walls: list[Wall],
+    footprint: list[tuple[float, float]],
+    scale: float,
+) -> list[Wall]:
+    """Add the exterior walls segmentation missed, closing the building.
+
+    Segmentation loses stretches of wall wherever a drawing is busy, and the
+    building comes out with holes in its facade -- on the reference set, only
+    two thirds of each storey's perimeter had a wall on it, with gaps as long
+    as 43 ft. Those holes also cost every window that would have been bound
+    to the missing wall.
+
+    A gap is only filled where the space just inside it is a room. A terrace
+    or courtyard edge is legitimately open, and walling it in would enclose
+    the very spaces that make the plan what it is.
+    """
+    if not footprint or scale <= 0:
+        return []
+
+    height, width = mask.shape
+    step_px = ENVELOPE_SAMPLE_FT * scale
+    near_px = ENVELOPE_NEAR_FT * scale
+    probe_px = ENVELOPE_PROBE_FT * scale
+    centre = np.array(
+        [sum(p[0] for p in footprint), sum(p[1] for p in footprint)], dtype=float
+    ) / len(footprint)
+
+    added: list[Wall] = []
+
+    for index in range(len(footprint)):
+        start = np.array(footprint[index], dtype=float)
+        end = np.array(footprint[(index + 1) % len(footprint)], dtype=float)
+        span = float(np.linalg.norm(end - start))
+        if span < ENVELOPE_MIN_GAP_FT * scale:
+            continue
+
+        steps = max(int(span / step_px), 1)
+        run_start = None
+
+        for step in range(steps + 1):
+            point = start + (end - start) * (step / steps)
+
+            has_wall = walls and min(
+                _project_onto_wall(tuple(point), wall)[1] for wall in walls
+            ) <= near_px
+
+            # Probe inward: a wall is only wanted where a room lies behind.
+            inward = point + (centre - point) / max(
+                np.linalg.norm(centre - point), 1e-6
+            ) * probe_px
+            column, row = int(round(inward[0])), int(round(inward[1]))
+            encloses_room = (
+                0 <= row < height
+                and 0 <= column < width
+                and (mask[row, column] in ROOM_CLASSES or mask[row, column] == WALL)
+            )
+
+            needs_wall = not has_wall and encloses_room
+
+            if needs_wall and run_start is None:
+                run_start = point
+            elif not needs_wall and run_start is not None:
+                if float(np.linalg.norm(point - run_start)) >= ENVELOPE_MIN_GAP_FT * scale:
+                    added.append(
+                        Wall(
+                            start=tuple(run_start),
+                            end=tuple(point),
+                            thickness=ENVELOPE_WALL_FT * scale,
+                        )
+                    )
+                run_start = None
+
+        if run_start is not None:
+            if float(np.linalg.norm(end - run_start)) >= ENVELOPE_MIN_GAP_FT * scale:
+                added.append(
+                    Wall(
+                        start=tuple(run_start),
+                        end=tuple(end),
+                        thickness=ENVELOPE_WALL_FT * scale,
+                    )
+                )
+
+    if added:
+        logger.info("closed %d gap(s) in the building envelope", len(added))
+    return added
+
+
+def extract_footprint(
+    mask: np.ndarray,
+    simplify_pixels: float | None = None,
+    gauge: float | None = None,
+) -> list[tuple[float, float]]:
+    """Outline of the built area, for generating floor slabs and a roof.
+
+    Walls and rooms together make up the storey's extent, so the outer
+    contour of both classes traces its footprint. Returns an empty list when
+    the mask holds no building.
+    """
+    built = ((mask == WALL) | np.isin(mask, list(ROOM_CLASSES))).astype(np.uint8)
+    if not built.any():
+        return []
+
+    # Sized against the drawing's own walls: a doorway is about the same
+    # multiple of a wall thickness whatever the sheet's resolution, and a
+    # spur worth erasing is thinner than a wall.
+    gauge = wall_gauge(mask) if gauge is None else gauge
+    if simplify_pixels is None:
+        simplify_pixels = SIMPLIFY_RATIO * gauge
+    close_span = max(int(CLOSE_SPAN_RATIO * gauge), 3)
+    open_span = max(int(OPEN_SPAN_RATIO * gauge), 3)
+
+    # Bridge doorways and joints so the storey reads as one region.
+    closed = cv2.morphologyEx(built, cv2.MORPH_CLOSE, np.ones((close_span, close_span), np.uint8))
+
+    # Erode away thin spurs, then restore the body. Segmentation bleeds into
+    # landscaping and paving around the building, and those tendrils otherwise
+    # end up in the outline -- producing slabs with jagged fingers reaching
+    # out over open ground.
+    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, np.ones((open_span, open_span), np.uint8))
+    if not opened.any():
+        opened = closed
+
+    # Keep only the main mass, so a detached patch of paving cannot drag the
+    # outline out across the site.
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(opened, 8)
+    if count > 1:
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        opened = (labels == largest).astype(np.uint8)
+
+    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+
+    outer = max(contours, key=cv2.contourArea)
+    simplified = cv2.approxPolyDP(outer, simplify_pixels, closed=True)
+    polygon = [(float(p[0][0]), float(p[0][1])) for p in simplified]
+
+    # Square it, for the same reason rooms are squared and more urgently:
+    # the footprint is the building's silhouette. It carries the floor
+    # slabs, the roof and the parapet, so a jagged trace here is visible
+    # from every angle at once -- a notched roof edge, and a parapet that
+    # staggers in and out along a wall that is dead straight on the
+    # drawing. Rooms were squared and this was not, which is why models
+    # kept a traced look after the rooms themselves came out clean.
+    # Measured over 40 plans: 31 vertices to 10, and the share of the
+    # perimeter running neither horizontal nor vertical from 6.8% to none,
+    # while the area it encloses moves by 0.0% at the median.
+    return _rectilinear(polygon, gauge)
+
+
+# How far a room's area may move when its corners are squared before the
+# squaring is judged to have gone wrong and the traced outline is kept.
+# Squaring a genuinely rectilinear room barely moves it; a fifth means the
+# room was not rectilinear, or the trace was too poor to straighten.
+MAX_SQUARING_DRIFT = 0.2
+
+# Fewest edges a squared room can have.
+MIN_RECTILINEAR_EDGES = 4
+
+# Shallowest step an outline may keep, as a multiple of the drawing's own
+# wall thickness. A step shallower than the wall it is cut into cannot be
+# built -- there is no such thing as a four-inch jog in a room's edge -- so
+# anything below this is noise in the mask rather than architecture.
+#
+# Squaring alone does not remove these. It makes every edge axis-aligned,
+# which is why a traced room comes back rectilinear and still wrong: a
+# 500-pixel room arrives with a dozen 4-to-17-pixel notches in its sides,
+# all perfectly square and none of them real. Measured over 30 plans,
+# collapsing them takes a room from 12.2 vertices to 6.9 without losing any
+# of its area. The useful range is wide -- anything from 0.75 to 2 gives
+# much the same answer -- so this sits in the middle of it rather than on
+# an edge.
+MIN_STEP_RATIO = 1.0
+
+# Area, in squared wall-thicknesses, above which a region is worth
+# mentioning when something goes wrong with it. Below this it is a speck
+# that will be filtered out long before it could become a room, and saying
+# so at the same volume as a real failure buries the real ones.
+SUBSTANTIAL_REGION_GAUGES = 16.0
+
+
+def _collapse_steps(lines: list[list], threshold: float) -> list[list]:
+    """Drop lines shorter than ``threshold`` and rejoin what they separated.
+
+    ``lines`` alternates horizontal and vertical, so removing one leaves
+    its neighbours pointing the same way; they merge into a single line at
+    the length-weighted average of their positions, which keeps a long
+    edge from being dragged off true by the short one beside it.
+
+    Shortest first, because removing one changes nothing else's length but
+    can only make its neighbours longer. Stops at four edges, since a
+    rectangle is the least an outline can be.
+    """
+    lines = [list(line) for line in lines]
+    while len(lines) > MIN_RECTILINEAR_EDGES:
+        index = min(range(len(lines)), key=lambda i: lines[i][2])
+        if lines[index][2] >= threshold:
+            break
+
+        lines.pop(index)
+        # The neighbours either side of the hole now point the same way.
+        before = (index - 1) % len(lines)
+        after = index % len(lines)
+        if before == after or lines[before][0] != lines[after][0]:
+            break
+
+        first, second = lines[before], lines[after]
+        total = first[2] + second[2]
+        first[1] = (first[1] * first[2] + second[1] * second[2]) / max(total, 1e-9)
+        first[2] = total
+        lines.pop(after)
+
+    return lines
+
+
+def _rectilinear(
+    polygon: list[tuple[float, float]], gauge: float | None = None
+) -> list[tuple[float, float]]:
+    """Square a traced contour's corners.
+
+    Rooms are drawn with square corners and come back from segmentation as
+    blobs: measured over twelve CubiCasa plans, the annotated rooms run
+    98.5% square on four vertices while the traced ones run 72.9% on ten.
+    A quarter of every room's perimeter was diagonal, which is what makes
+    a finished model read as approximate rather than as a building.
+
+    Walls have been forced axis-aligned since the beginning, for the same
+    reason and by the same argument. This is that rule applied to rooms.
+
+    Each edge is called horizontal or vertical by whichever way it mostly
+    runs, runs of like edges collapse into one line, and the corners come
+    back as the intersections of neighbours. The result is rectilinear by
+    construction rather than approximately so.
+
+    Given a ``gauge`` it also drops the steps shallower than one wall
+    thickness, which squaring on its own leaves behind -- see
+    ``_collapse_steps``. Without one the outline is only squared, since
+    there is then nothing to judge "too shallow" against.
+    """
+    if len(polygon) < MIN_RECTILINEAR_EDGES:
+        return polygon
+
+    points = np.asarray(polygon, dtype=float)
+
+    # Each edge as (horizontal?, the coordinate it holds fixed, its length).
+    edges = []
+    for index in range(len(points)):
+        start, end = points[index], points[(index + 1) % len(points)]
+        delta = end - start
+        horizontal = abs(delta[0]) >= abs(delta[1])
+        # A horizontal edge fixes y, a vertical one fixes x.
+        fixed = (start[1] + end[1]) / 2 if horizontal else (start[0] + end[0]) / 2
+        edges.append([horizontal, fixed, float(np.hypot(*delta))])
+
+    # Collapse runs pointing the same way into a single line, at the
+    # length-weighted average of their coordinates -- so a long wall is not
+    # dragged off true by a short jag beside it.
+    merged: list[list] = []
+    for edge in edges:
+        if merged and merged[-1][0] == edge[0]:
+            previous = merged[-1]
+            total = previous[2] + edge[2]
+            previous[1] = (previous[1] * previous[2] + edge[1] * edge[2]) / max(total, 1e-9)
+            previous[2] = total
+        else:
+            merged.append(list(edge))
+
+    # The list is a loop, so the ends may meet in the same orientation too.
+    while len(merged) > 2 and merged[0][0] == merged[-1][0]:
+        first, last = merged[0], merged.pop()
+        total = first[2] + last[2]
+        first[1] = (first[1] * first[2] + last[1] * last[2]) / max(total, 1e-9)
+        first[2] = total
+
+    if len(merged) < MIN_RECTILINEAR_EDGES or len(merged) % 2:
+        return polygon
+
+    # Now that the outline is square, throw away the steps too shallow to
+    # build. This is where a traced outline stops looking traced.
+    if gauge:
+        merged = _collapse_steps(merged, MIN_STEP_RATIO * gauge)
+        if len(merged) < MIN_RECTILINEAR_EDGES or len(merged) % 2:
+            return polygon
+
+    # Corners are where each line meets the next. Alternating orientation is
+    # guaranteed by the merge above, so every pair gives one x and one y.
+    corners = []
+    for index in range(len(merged)):
+        this, following = merged[index], merged[(index + 1) % len(merged)]
+        if this[0]:  # horizontal, so it holds y and the next holds x
+            corners.append((following[1], this[1]))
+        else:
+            corners.append((this[1], following[1]))
+
+    before = abs(_polygon_area(polygon))
+    after = abs(_polygon_area(corners))
+    if before <= 0 or abs(after - before) / before > MAX_SQUARING_DRIFT:
+        # Said quietly for a fragment and out loud for a room. Contours
+        # arrive here long before anything filters them by real-world size,
+        # so the great majority of refusals are on specks that never become
+        # rooms -- on the reference sheet, 43 of them at a median of under
+        # three square feet. Logged at the same level as a real one, they
+        # read as a building full of broken geometry, which sent one
+        # investigation chasing a fault that was not there.
+        size = before / gauge**2 if gauge else 0.0
+        say = logger.info if size >= SUBSTANTIAL_REGION_GAUGES else logger.debug
+        say(
+            "squaring moved a region of %.0f square wall-thicknesses too far; "
+            "keeping the trace",
+            size,
+        )
+        return polygon
+
+    return corners
+
+
+def _polygon_area(polygon: list[tuple[float, float]]) -> float:
+    """Signed area, by the shoelace formula."""
+    if len(polygon) < MIN_POLYGON_VERTICES:
+        return 0.0
+    points = np.asarray(polygon, dtype=float)
+    x, y = points[:, 0], points[:, 1]
+    return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+# How far a room pixel looks, in wall thicknesses, when its type is settled
+# by the types around it. On 60 held-out CubiCasa plans 1 and 2 both left
+# the scorecard exactly where it was (39 of 60, rooms failing on 8) and
+# open-air IoU within 0.1 point; on drawings from other conventions 2 turned
+# ragged, bitten rooms back into rectangles. Much wider begins to swallow
+# small rooms whole.
+ROOM_VOTE_RATIO = 2.0
+
+
+def _vote_room_types(mask: np.ndarray, gauge: float) -> np.ndarray:
+    """Settle each room pixel's type by the room types around it.
+
+    On a drawing unlike its training data the model is often unsure what a
+    room is for and paints one room in patches of two types. Traced type by
+    type, each patch became its own ragged room. Only room pixels change,
+    and only between room types, so no wall, opening or outside space moves;
+    and a patch as large as an open kitchen outvotes its neighbour and keeps
+    its own type.
+    """
+    size = int(round(ROOM_VOTE_RATIO * gauge)) | 1
+    room_types = np.array(sorted(ROOM_CLASSES))
+    is_room = np.isin(mask, room_types)
+    if size < 3 or not is_room.any():
+        return mask
+
+    votes = np.stack([
+        cv2.boxFilter((mask == c).astype(np.float32), -1, (size, size), normalize=False)
+        for c in room_types
+    ])
+    voted = mask.copy()
+    voted[is_room] = room_types[votes.argmax(axis=0)][is_room]
+    return voted
+
+
+def extract_rooms(
+    mask: np.ndarray,
+    room_class: int | None = None,
+    min_area: int | None = None,
+    simplify_pixels: float | None = None,
+    gauge: float | None = None,
+) -> list[Room]:
+    """Recover room polygons from a class mask, in the mask's pixel coordinates.
+
+    Every room class is traced separately and each room carries the class it
+    came from as its ``category``. Tracing them together would merge a
+    kitchen into the living room it opens onto, since nothing but the class
+    separates them -- there is no wall between an open kitchen and its
+    dining area, which is the whole point of an open kitchen.
+
+    Pass ``room_class`` to restrict the search to a single class.
+
+    Regions that cannot form a valid polygon are logged and skipped rather
+    than raised, so one malformed room does not abort a floor.
+
+    Sizes come from the drawing's own wall thickness, so the same plan is
+    read the same way whatever size it is rendered at.
+    """
+    gauge = wall_gauge(mask) if gauge is None else gauge
+    if min_area is None:
+        min_area = max(int(MIN_ROOM_AREA_RATIO * gauge**2), 16)
+    if simplify_pixels is None:
+        simplify_pixels = SIMPLIFY_RATIO * gauge
+
+    wanted = ROOM_CLASSES if room_class is None else {room_class}
+    mask = _vote_room_types(mask, gauge)
+
+    rooms: list[Room] = []
+    for class_index in sorted(wanted):
+        binary = (mask == class_index).astype(np.uint8)
+        if not binary.any():
+            continue
+
+        # The generic ROOM class carries no information, so it is left
+        # uncategorised rather than labelled "room" -- downstream needs to
+        # tell "no opinion" apart from a positive identification.
+        category = "" if class_index == ROOM else CLASS_NAMES[class_index]
+
+        contours, _ = cv2.findContours(
+            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < min_area:
+                continue
+
+            simplified = cv2.approxPolyDP(contour, simplify_pixels, closed=True)
+            polygon = [(float(p[0][0]), float(p[0][1])) for p in simplified]
+            polygon = _rectilinear(polygon, gauge)
+
+            try:
+                rooms.append(Room(polygon=polygon, category=category))
+            except ValueError as error:
+                logger.warning("skipping region of area %.0f: %s", area, error)
+
+    typed = sum(1 for room in rooms if room.category)
+    logger.info("extracted %d room polygon(s), %d typed", len(rooms), typed)
+    return rooms

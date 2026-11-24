@@ -1,0 +1,330 @@
+import numpy as np
+import pytest
+
+from creston.classes import BACKGROUND, BEDROOM, DOOR, KITCHEN, OUTDOOR, ROOM, WALL, WINDOW
+from creston.extract import (
+    MAX_THICKNESS_RATIO,
+    _drop_impossibly_thick,
+    _typical_thickness,
+    extract_rooms,
+    extract_walls,
+)
+from creston.geometry_types import Wall
+
+
+def _blank(size: int = 60) -> np.ndarray:
+    return np.full((size, size), BACKGROUND, dtype=np.int64)
+
+
+def _horizontal(mask, y, x0, x1, thickness=3):
+    mask[y : y + thickness, x0:x1] = WALL
+
+
+def _vertical(mask, x, y0, y1, thickness=3):
+    mask[y0:y1, x : x + thickness] = WALL
+
+
+def _axis(wall) -> str:
+    dx = abs(wall.end[0] - wall.start[0])
+    dy = abs(wall.end[1] - wall.start[1])
+    return "horizontal" if dx >= dy else "vertical"
+
+
+def test_extract_walls_finds_a_single_horizontal_wall():
+    mask = _blank()
+    _horizontal(mask, y=20, x0=10, x1=50, thickness=3)
+
+    walls = extract_walls(mask)
+
+    assert len(walls) == 1
+    wall = walls[0]
+    assert _axis(wall) == "horizontal"
+    assert wall.length() == pytest.approx(40, abs=2)
+    assert wall.thickness == pytest.approx(3, abs=1)
+
+
+def test_extract_walls_splits_a_closed_loop_into_separate_segments():
+    # Four walls meeting at corners form one connected region. Contour
+    # detection alone returns the ring as a single shape, so the extractor
+    # has to decompose it by orientation.
+    mask = _blank()
+    _horizontal(mask, y=10, x0=10, x1=50)
+    _horizontal(mask, y=47, x0=10, x1=50)
+    _vertical(mask, x=10, y0=10, y1=50)
+    _vertical(mask, x=47, y0=10, y1=50)
+
+    walls = extract_walls(mask)
+
+    assert len(walls) == 4
+    orientations = sorted(_axis(w) for w in walls)
+    assert orientations == ["horizontal", "horizontal", "vertical", "vertical"]
+    for wall in walls:
+        assert wall.length() == pytest.approx(40, abs=4)
+
+
+def test_extract_walls_ignores_speckle_noise():
+    mask = _blank()
+    _horizontal(mask, y=20, x0=10, x1=50)
+    mask[40, 5] = WALL
+    mask[45, 30] = WALL
+    mask[50:52, 20:22] = WALL
+
+    walls = extract_walls(mask)
+
+    assert len(walls) == 1
+
+
+def test_extract_walls_returns_nothing_for_a_mask_with_no_walls():
+    assert extract_walls(_blank()) == []
+
+
+def test_a_wall_far_thicker_than_the_drawing_is_cut_back_to_what_it_can_be():
+    # A stair core, a hatched panel or two parallel walls caught as one run
+    # come out several times the drawing's own wall thickness. Painted at
+    # that thickness they swamp a plan: on held-out plan 6094, whose walls
+    # gauge 20 px, two runs 68 and 54 px thick carried 43% of all painted
+    # wall and agreed with the annotation only 60% of the time.
+    from creston.extract import MAX_THICKNESS_RATIO
+
+    mask = _blank(400)
+    for y in (40, 150, 260, 370):            # ordinary walls, 8 px thick
+        _horizontal(mask, y=y, x0=20, x1=380, thickness=8)
+    mask[180:260, 200:320] = WALL            # a block 80 px deep
+
+    walls = extract_walls(mask, gauge=8.0)
+
+    assert walls
+    assert max(wall.thickness for wall in walls) <= 8.0 * MAX_THICKNESS_RATIO
+    # The ordinary walls are untouched.
+    assert sum(1 for wall in walls if wall.thickness == pytest.approx(8, abs=1)) >= 3
+
+
+def test_a_thickness_the_drawing_supports_is_left_alone():
+    from creston.extract import MAX_THICKNESS_RATIO
+
+    mask = _blank(400)
+    for y in (40, 150, 260, 370):
+        _horizontal(mask, y=y, x0=20, x1=380, thickness=16)
+
+    walls = extract_walls(mask, gauge=16.0)
+
+    assert walls
+    assert all(wall.thickness <= 16.0 * MAX_THICKNESS_RATIO for wall in walls)
+    assert max(wall.thickness for wall in walls) == pytest.approx(16, abs=1)
+
+
+def _walled_room(size=200):
+    mask = _blank(size)
+    _horizontal(mask, y=20, x0=20, x1=180, thickness=6)
+    _horizontal(mask, y=174, x0=20, x1=180, thickness=6)
+    _vertical(mask, x=20, y0=20, y1=180, thickness=6)
+    _vertical(mask, x=174, y0=20, y1=180, thickness=6)
+    return mask
+
+
+def test_a_room_speckled_with_another_type_comes_out_as_one_room():
+    # On an unfamiliar drawing the model is unsure what a room is for and
+    # paints a bedroom partly as a plain room. Traced type by type, the
+    # bedroom came out as a ragged shape with a bite taken out of it.
+    # Patches smaller than a wall thickness, as the argmax leaves them.
+    mask = _walled_room()
+    mask[26:174, 26:174] = BEDROOM
+    for y, x in [(40, 60), (70, 120), (110, 50), (140, 150), (150, 90)]:
+        mask[y : y + 5, x : x + 5] = ROOM
+    mask[26:31, 80:84] = ROOM
+
+    rooms = extract_rooms(mask, gauge=6)
+
+    assert [room.category for room in rooms] == ["bedroom"]
+    assert len(rooms[0].polygon) == 4
+
+
+def test_an_open_kitchen_beside_its_living_room_stays_two_rooms():
+    # Nothing but the type separates an open kitchen from the room it opens
+    # onto, so tidying the types must not merge areas this large.
+    mask = _walled_room()
+    mask[26:174, 26:100] = KITCHEN
+    mask[26:174, 100:174] = ROOM
+
+    rooms = extract_rooms(mask, gauge=6)
+
+    assert sorted(room.category for room in rooms) == ["", "kitchen"]
+
+
+@pytest.mark.parametrize("opening", [WINDOW, DOOR])
+def test_an_opening_drawn_across_a_wall_does_not_cut_it_in_two(opening):
+    # A model trained on solid window labels paints the window over the wall
+    # it sits in. Read as a gap, the wall came apart there, and over 60
+    # held-out plans 222 of 477 windows then had no wall near enough to be
+    # built into. The opening belongs to the wall, so the wall runs through it.
+    mask = _blank(200)
+    _horizontal(mask, y=100, x0=10, x1=190, thickness=6)
+    mask[100:106, 70:130] = opening
+
+    walls = extract_walls(mask)
+
+    assert len(walls) == 1
+    assert walls[0].length() == pytest.approx(180, abs=6)
+
+
+def test_extract_rooms_finds_one_polygon_per_enclosed_region():
+    mask = _blank()
+    mask[10:30, 10:30] = ROOM
+    mask[35:55, 35:55] = ROOM
+
+    rooms = extract_rooms(mask)
+
+    assert len(rooms) == 2
+    for room in rooms:
+        assert room.label == ""
+
+
+def test_extract_rooms_simplifies_a_rectangle_to_its_corners():
+    # A raw contour traces every boundary pixel; a rectangle should reduce to
+    # roughly four vertices so downstream geometry stays manageable.
+    mask = _blank()
+    mask[10:50, 10:50] = ROOM
+
+    rooms = extract_rooms(mask)
+
+    assert len(rooms) == 1
+    assert len(rooms[0].polygon) <= 6
+
+
+def test_extract_rooms_ignores_regions_below_the_area_floor():
+    mask = _blank()
+    mask[10:40, 10:40] = ROOM
+    mask[50:53, 50:53] = ROOM
+
+    rooms = extract_rooms(mask)
+
+    assert len(rooms) == 1
+
+
+def test_extract_rooms_returns_nothing_for_a_mask_with_no_rooms():
+    assert extract_rooms(_blank()) == []
+
+
+class TestRoomTypesComeThroughExtraction:
+    def _mask(self):
+        mask = np.zeros((200, 200), dtype=np.int64)
+        mask[10:90, 10:90] = ROOM
+        mask[10:90, 110:190] = BEDROOM
+        mask[110:190, 10:90] = KITCHEN
+        mask[110:190, 110:190] = OUTDOOR
+        return mask
+
+    def test_each_room_carries_the_class_it_came_from(self):
+        rooms = extract_rooms(self._mask())
+
+        assert sorted(room.category for room in rooms) == [
+            "",
+            "bedroom",
+            "kitchen",
+            "outdoor",
+        ]
+
+    def test_the_generic_class_stays_uncategorised(self):
+        # "room" as a category would be indistinguishable from a positive
+        # identification, and the pipeline needs to know the model had no
+        # opinion so a printed name can supply one.
+        mask = np.zeros((100, 100), dtype=np.int64)
+        mask[10:90, 10:90] = ROOM
+
+        assert extract_rooms(mask)[0].category == ""
+
+    def test_adjoining_rooms_of_different_types_stay_separate(self):
+        # An open kitchen has no wall between it and the dining area it
+        # opens onto. Tracing both classes together would return one room
+        # and one floor finish for what are plainly two spaces.
+        mask = np.zeros((100, 200), dtype=np.int64)
+        mask[10:90, 10:100] = ROOM
+        mask[10:90, 100:190] = KITCHEN
+
+        rooms = extract_rooms(mask)
+
+        assert len(rooms) == 2
+        assert {room.category for room in rooms} == {"", "kitchen"}
+
+    def test_a_single_class_can_still_be_asked_for(self):
+        rooms = extract_rooms(self._mask(), room_class=KITCHEN)
+
+        assert len(rooms) == 1
+        assert rooms[0].category == "kitchen"
+
+
+class TestRunsTooThickToBeWalls:
+    """Boundary hatching and dimension bands segment as enormous walls.
+
+    On the reference sheet the median wall run measures 10 inches and the
+    fattest nearly ten feet. Left in, that becomes a solid slab across the
+    plan -- and worse, it drags the wall-thickness scale estimate with it,
+    so the whole building is built the wrong size.
+
+    Tested on the rule directly rather than through a rasterized mask. A
+    mask of bands also yields runs the fixture did not intend, and a test
+    that trips over those is measuring the fixture.
+    """
+
+    def _walls(self, thicknesses, length=400.0):
+        return [
+            Wall(start=(0.0, index * 50.0), end=(length, index * 50.0), thickness=float(t))
+            for index, t in enumerate(thicknesses)
+        ]
+
+    def _kept(self, thicknesses, **kwargs):
+        walls = self._walls(thicknesses, **kwargs)
+        return sorted(round(wall.thickness) for wall in _drop_impossibly_thick(walls))
+
+    def test_a_band_far_thicker_than_the_walls_is_dropped(self):
+        assert self._kept([10] * 8 + [120]) == [10] * 8
+
+    def test_ordinary_walls_all_survive(self):
+        # Real walls span a narrow range and every one has to be kept: a 4
+        # inch partition beside an 18 inch external wall.
+        bands = [8, 10, 12, 16, 20, 24]
+
+        assert self._kept(bands) == sorted(bands)
+
+    def test_nothing_is_judged_on_too_few_runs(self):
+        # A handful of runs could easily be mostly hatching, and taking
+        # their reference would discard the walls and keep the hatching.
+        assert 200 in self._kept([10, 10, 200])
+
+    def test_a_drawing_of_thick_walls_is_left_alone(self):
+        # The limit moves with the drawing, so a plan drawn at a larger
+        # scale is not gutted for having thicker lines.
+        bands = [40, 44, 48, 52, 56, 60, 64]
+
+        assert self._kept(bands) == sorted(bands)
+
+    def test_the_walls_are_kept_when_too_much_would_go(self):
+        # Beyond a small fraction the reference was measuring the wrong
+        # thing. Allowing half to go once left a drawing with a two pixel
+        # median wall, putting the building at a thirtieth of its size.
+        kept = self._kept([6, 6, 90, 90, 90, 90, 90, 90])
+
+        assert kept == [6, 6, 90, 90, 90, 90, 90, 90]
+
+    def test_the_reference_follows_the_longest_walls_not_the_most_numerous(self):
+        # Short specks of noise outnumbering the walls must not set the
+        # thickness: that is what took a real drawing down to 3 px/ft.
+        walls = self._walls([6] * 10, length=8.0) + self._walls([24] * 4, length=900.0)
+
+        assert _typical_thickness(walls) == pytest.approx(24.0)
+
+    def test_it_runs_through_extraction(self):
+        # And the rule is actually wired into extract_walls, not merely
+        # available beside it.
+        # As many walls as a real storey has. A single thick band is found
+        # by both the horizontal and the vertical pass, so it costs two
+        # drops, and on a drawing of only a few runs that is a large enough
+        # share to trip the guard against over-eager removal.
+        mask = np.full((1200, 1200), BACKGROUND, dtype=np.int64)
+        row = 30
+        for index, thickness in enumerate([10] * 16 + [200]):
+            left = 30 + index * 8
+            mask[row : row + thickness, left : left + 420] = WALL
+            row += thickness + 30
+
+        assert max(wall.thickness for wall in extract_walls(mask, merge=False)) < 200

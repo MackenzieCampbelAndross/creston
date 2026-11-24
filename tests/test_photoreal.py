@@ -1,0 +1,366 @@
+import numpy as np
+import pytest
+from PIL import Image
+
+from creston.design import STYLES, TIMES, TONES, Design
+from creston.geometry_types import FloorPlan, Opening, Wall
+from creston.materials import build_scene, export_scene
+from creston.photoreal import (
+    FIXED_HOUSE_PHRASES,
+    MAX_PROMPT_TOKENS,
+    NEGATIVE_PROMPT,
+    STYLE_PHRASES,
+    _tokens,
+    build_guides,
+    build_negative_prompt,
+    build_prompt,
+    edge_guide,
+)
+
+FOOTPRINT = [(0.0, 0.0), (400.0, 0.0), (400.0, 300.0), (0.0, 300.0)]
+
+
+@pytest.fixture
+def model(tmp_path):
+    walls = [
+        Wall(start=FOOTPRINT[i], end=FOOTPRINT[(i + 1) % 4], thickness=10.0)
+        for i in range(4)
+    ]
+    plan = FloorPlan(
+        walls=walls,
+        footprint=list(FOOTPRINT),
+        openings=[Opening(wall_id=0, position=200.0, width=120.0, type="window")],
+    )
+    path = tmp_path / "house.glb"
+    export_scene(build_scene([plan, plan], wall_height_ft=9.0, scale=20.0), path)
+    return path
+
+
+class TestPrompt:
+    def test_names_the_storey_count(self):
+        assert "3-storey" in build_prompt(3)
+
+    def test_mentions_features_the_plan_actually_has(self):
+        prompt = build_prompt(3, ["BEDROOM", "PARKING", "TERRACE GARDEN"])
+
+        assert "cars" in prompt
+        assert "lawn" in prompt
+        assert "terrace" in prompt.lower()
+
+    def test_does_not_invent_features_the_plan_lacks(self):
+        # A stylization stops resembling its subject when the prompt asks for
+        # things the building does not have.
+        prompt = build_prompt(2, ["BEDROOM", "KITCHEN"])
+
+        assert "cars" not in prompt
+        assert "lawn" not in prompt
+
+    def test_labels_are_optional(self):
+        assert build_prompt(2)
+
+    def test_the_prompt_needs_no_3d_stack(self):
+        # The generation environment installs diffusion packages, not trimesh
+        # or shapely, and only ever wants the prompt. Importing this module
+        # must not drag in the mesh libraries.
+        import subprocess
+        import sys
+
+        script = (
+            "import sys;"
+            "sys.modules['trimesh'] = None;"
+            "sys.modules['shapely'] = None;"
+            "from creston.photoreal import build_prompt, NEGATIVE_PROMPT;"
+            "assert build_prompt(3);"
+            "print('ok')"
+        )
+        finished = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True
+        )
+
+        assert finished.returncode == 0, finished.stderr
+
+
+class TestGuides:
+    def test_all_three_guides_are_produced(self, model, tmp_path):
+        guides = build_guides(model, tmp_path, resolution=(256, 192))
+
+        assert set(guides) == {"render", "depth", "edges"}
+        assert all(path.exists() for path in guides.values())
+
+    def test_the_guides_share_one_camera(self, model, tmp_path):
+        # A depth map and an edge map shot from different angles fight, and
+        # the diffusion model resolves the conflict by warping the building.
+        guides = build_guides(model, tmp_path, resolution=(256, 192))
+
+        sizes = {Image.open(path).size for path in guides.values()}
+        assert len(sizes) == 1
+
+    def test_depth_is_single_channel_with_near_surfaces_bright(self, model, tmp_path):
+        guides = build_guides(model, tmp_path, resolution=(256, 192))
+        depth = np.asarray(Image.open(guides["depth"]))
+
+        assert depth.ndim == 2  # greyscale, as depth ControlNets expect
+        assert depth.max() > depth.min()
+
+    def test_background_reads_as_far_away_not_near(self, model, tmp_path):
+        # Undrawn pixels must be black. Left bright, the model reads the sky
+        # as a surface pressed against the camera.
+        guides = build_guides(model, tmp_path, resolution=(256, 192))
+        depth = np.asarray(Image.open(guides["depth"]))
+
+        assert depth[0, 0] == 0
+
+    def test_edges_are_binary_and_trace_the_building(self, model, tmp_path):
+        guides = build_guides(model, tmp_path, resolution=(256, 192))
+        edges = np.asarray(Image.open(guides["edges"]))
+
+        assert set(np.unique(edges)) <= {0, 255}
+        assert (edges == 255).any()
+
+    def test_a_missing_render_fails_clearly(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            edge_guide(tmp_path / "absent.png", tmp_path / "edges.png")
+
+
+class TestThePromptFitsWhatTheEncoderReads:
+    """CLIP reads 77 tokens and silently discards the rest.
+
+    The prompt ran to about 144, so half went -- and being the tail, the
+    half that went was everything derived from the drawing: the cars, the
+    lawn, the terrace, the balconies. The generic opening survived and the
+    specific ending did not, which is exactly backwards.
+    """
+
+    RICH = ["PARKING", "TERRACE GARDEN", "LANDSCAPE", "BALCONY", "SWIMMING POOL", "TEMPLE"]
+
+    def test_it_fits(self):
+        assert _tokens(build_prompt(3, self.RICH)) <= MAX_PROMPT_TOKENS
+
+    def test_it_fits_with_nothing_to_say(self):
+        assert _tokens(build_prompt(1, [])) <= MAX_PROMPT_TOKENS
+
+    def test_the_negative_prompt_fits_too(self):
+        assert _tokens(NEGATIVE_PROMPT) <= MAX_PROMPT_TOKENS
+
+    @pytest.mark.parametrize(
+        "label, phrase",
+        [
+            ("PARKING", "cars"),
+            ("LANDSCAPE", "lawn"),
+            ("TERRACE GARDEN", "terrace"),
+            ("BALCONY", "balcon"),
+            ("SWIMMING POOL", "pool"),
+        ],
+    )
+    def test_what_the_drawing_shows_survives_the_budget(self, label, phrase):
+        # The whole point. These are the only phrases the drawing justifies,
+        # so they must outrank the generic ones rather than being cut for
+        # them.
+        assert phrase in build_prompt(3, self.RICH).lower(), phrase
+
+    def test_the_subject_and_its_light_are_never_dropped(self):
+        # A building of the wrong material is wrong in every frame, and a
+        # dusk render without described lighting is just a dark one.
+        prompt = build_prompt(3, self.RICH).lower()
+
+        assert "residence" in prompt
+        assert "limestone" in prompt
+        assert "amber" in prompt
+
+    def test_nothing_is_claimed_that_the_drawing_does_not_show(self):
+        plain = build_prompt(2, ["BEDROOM", "KITCHEN"]).lower()
+
+        for absent in ("pool", "cars", "balcon", "terrace"):
+            assert absent not in plain, absent
+
+    def test_the_storey_count_comes_through(self):
+        assert "4-storey" in build_prompt(4, [])
+
+
+def _design(**overrides):
+    base = dict(
+        style="modern", colour="warm", time="day",
+        landscaping="basic", creativity="balanced",
+    )
+    base.update(overrides)
+    return Design(**base)
+
+
+def test_every_style_changes_the_prompt():
+    # A traditional house described as "modern" is the wrong building.
+    prompts = {
+        style: build_prompt(2, ["BALCONY"], design=_design(style=style))
+        for style in STYLES
+    }
+    assert len(set(prompts.values())) == len(STYLES), prompts
+
+
+def test_the_style_subject_matches_its_own_material_not_a_swapped_one():
+    # Pairwise-distinct is not the same as correct -- that would still pass
+    # if two styles' entries were swapped. traditional renders in brick with
+    # a pitched roof (STYLES["traditional"] in design.py); minimalist is
+    # near-white with no roof material named, so it must not claim brick.
+    traditional = build_prompt(2, ["BALCONY"], design=_design(style="traditional")).lower()
+    minimalist = build_prompt(2, ["BALCONY"], design=_design(style="minimalist")).lower()
+
+    assert "brick" in traditional or "pitched" in traditional
+    assert "brick" not in minimalist
+
+
+def test_every_time_of_day_changes_the_prompt():
+    prompts = {
+        time: build_prompt(2, ["BALCONY"], design=_design(time=time))
+        for time in TIMES
+    }
+    assert len(set(prompts.values())) == len(TIMES), prompts
+
+
+def test_every_tone_changes_the_prompt():
+    prompts = {
+        tone: build_prompt(2, ["BALCONY"], design=_design(colour=tone))
+        for tone in TONES
+    }
+    assert len(set(prompts.values())) == len(TONES), prompts
+
+
+def test_night_matches_the_dusk_lighting_the_renderer_actually_uses():
+    # design.py's TIMES maps "night" to the "dusk" lighting preset -- a
+    # twilight sky with a low orange sun, not true darkness (Design.lighting
+    # picks LIGHTING_PRESETS["dusk"] for this choice). The prompt must agree
+    # with what the render beside it actually shows, not with the label the
+    # user picked, so it describes dusk and keeps the interior lights that
+    # make the hour read.
+    night = build_prompt(2, None, design=_design(time="night"))
+    assert "dusk" in night
+    assert "amber" in night
+
+
+def test_the_prompt_still_fits_the_token_budget():
+    # CLIP reads 77 tokens and silently drops the rest, tail first -- which
+    # is where the drawing-derived detail lives. Every combination must fit.
+    labels = ["BALCONY", "TERRACE GARDEN", "PARKING", "SWIMMING POOL"]
+    for style in STYLES:
+        for tone in TONES:
+            for time in TIMES:
+                design = _design(style=style, colour=tone, time=time)
+                prompt = build_prompt(3, labels, design=design)
+                assert _tokens(prompt) <= MAX_PROMPT_TOKENS, (style, tone, time)
+
+
+def test_every_site_feature_survives_the_budget_for_every_design():
+    # Fitting under MAX_PROMPT_TOKENS is not the same as saying the right
+    # things: a run where the total stays under budget can still have
+    # silently dropped a feature the plan actually shows and filled the
+    # freed space with a generic quality word instead. That happened here:
+    # a longer opening pushed "lit swimming pool" out for 6 of these 36
+    # combinations while "8k" slipped into the space it needed. Assert on
+    # which phrases survive, not just the token count.
+    labels = ["BALCONY", "TERRACE GARDEN", "PARKING", "SWIMMING POOL"]
+    site_phrases = [
+        "parked cars on a paved driveway",  # PARKING
+        "manicured lawn with clipped hedges",  # TERRACE GARDEN (GARDEN)
+        "planted roof terrace",  # TERRACE GARDEN (TERRACE)
+        "balconies with slim metal railings",  # BALCONY
+        "lit swimming pool",  # SWIMMING POOL
+    ]
+    for style in STYLES:
+        for tone in TONES:
+            for time in TIMES:
+                design = _design(style=style, colour=tone, time=time)
+                prompt = build_prompt(3, labels, design=design)
+                for phrase in site_phrases:
+                    assert phrase in prompt, (style, tone, time, phrase)
+
+
+def test_no_design_keeps_the_previous_wording():
+    # Every existing caller passes no design and must be unaffected.
+    assert "modern luxury residence at dusk" in build_prompt(2, ["BALCONY"])
+
+
+class TestFixedHousePhrasesExclusionIsCoupled:
+    # STYLE_PHRASES' two fixed-house entries are still excluded when a
+    # design is given, because FIXED_HOUSE_PHRASES is the same tuple both
+    # STYLE_PHRASES and the filter in build_prompt draw from -- rewording
+    # an entry in STYLE_PHRASES cannot silently stop the exclusion from
+    # matching, the way it could when the filter re-typed the strings.
+    def test_fixed_house_phrases_are_a_subset_of_style_phrases(self):
+        assert set(FIXED_HOUSE_PHRASES) <= set(STYLE_PHRASES)
+
+    def test_the_fixed_house_phrases_are_actually_excluded_with_a_design(self):
+        prompt = build_prompt(2, ["BALCONY"], design=_design())
+        for phrase in FIXED_HOUSE_PHRASES:
+            assert phrase not in prompt, phrase
+
+    def test_the_fixed_house_phrases_survive_with_no_design(self):
+        # The fallback contract: unchanged from before this branch.
+        prompt = build_prompt(2, ["BALCONY"])
+        for phrase in FIXED_HOUSE_PHRASES:
+            assert phrase in prompt, phrase
+
+
+class TestNegativePromptDoesNotContradictTheDesign:
+    def test_daylight_is_dropped_only_for_a_day_design(self):
+        assert "daylight" not in build_negative_prompt(_design(time="day"))
+        assert "daylight" in build_negative_prompt(_design(time="sunset"))
+        assert "daylight" in build_negative_prompt(_design(time="night"))
+
+    def test_barren_ground_is_dropped_only_when_nothing_is_planted(self):
+        assert "barren ground" not in build_negative_prompt(_design(landscaping="none"))
+        assert "barren ground" in build_negative_prompt(_design(landscaping="basic"))
+        assert "barren ground" in build_negative_prompt(_design(landscaping="premium"))
+
+    def test_no_design_keeps_the_plain_negative_prompt(self):
+        assert build_negative_prompt(None) == NEGATIVE_PROMPT
+        assert build_negative_prompt() == NEGATIVE_PROMPT
+
+    def test_the_rest_of_the_negative_prompt_survives(self):
+        trimmed = build_negative_prompt(_design(time="day", landscaping="none"))
+        for term in ("cartoon", "watermark", "warped walls", "flat lighting"):
+            assert term in trimmed, term
+
+
+class TestLandscapingNoneDropsPlantingClaims:
+    # Design(landscaping="none") strips Design.site().planting, and with
+    # it every lawn, driveway and pool extrude.py actually builds -- the
+    # prompt must stop claiming a setting the model does not have.
+    LABELS = ["PARKING", "TERRACE GARDEN", "LANDSCAPE", "SWIMMING POOL"]
+
+    def test_none_drops_the_planting_dependent_phrases(self):
+        prompt = build_prompt(2, self.LABELS, design=_design(landscaping="none"))
+        for absent in (
+            "parked cars on a paved driveway",
+            "manicured lawn with clipped hedges",
+            "lit swimming pool",
+            "planted roof terrace",
+        ):
+            assert absent not in prompt, absent
+
+    def test_none_still_names_the_terrace_structure(self):
+        # The terrace itself is not landscaping -- only "planted" is.
+        prompt = build_prompt(2, self.LABELS, design=_design(landscaping="none"))
+        assert "roof terrace" in prompt
+
+    def test_basic_and_premium_keep_the_planting_phrases(self):
+        for landscaping in ("basic", "premium"):
+            prompt = build_prompt(2, self.LABELS, design=_design(landscaping=landscaping))
+            for present in (
+                "parked cars on a paved driveway",
+                "manicured lawn with clipped hedges",
+                "lit swimming pool",
+                "planted roof terrace",
+            ):
+                assert present in prompt, (landscaping, present)
+
+    def test_balconies_are_unaffected_by_landscaping(self):
+        # Balcony railings are a building feature, not ground cover.
+        prompt = build_prompt(2, ["BALCONY"], design=_design(landscaping="none"))
+        assert "balconies with slim metal railings" in prompt
+
+
+def test_landscape_uplighting_is_dropped_only_for_a_day_design():
+    # Uplighting only reads as after-dark; keeping it for a midday design
+    # is the same contradiction FIXED_HOUSE_PHRASES exists to avoid.
+    day = build_prompt(2, ["BALCONY"], design=_design(time="day"))
+    night = build_prompt(2, ["BALCONY"], design=_design(time="night"))
+    assert "landscape uplighting" not in day
+    assert "landscape uplighting" in night
